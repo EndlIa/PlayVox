@@ -12,7 +12,6 @@ import subprocess
 import cv2
 import numpy as np
 import torch
-import imageio
 import gradio as gr
 
 try:
@@ -116,18 +115,6 @@ def propagate_masks_sam2(frames_dir, num_frames, object_points, hand_points):
     return object_masks, hand_masks
 
 
-def create_masked_video(frames, object_masks, hand_masks, fps, output_path, opacity=0.5):
-    out_frames = []
-    for frame, o_mask, h_mask in zip(frames, object_masks, hand_masks):
-        overlay = frame.copy().astype(np.float32)
-        color_layer = np.zeros_like(overlay)
-        color_layer[o_mask] = (255, 0, 0)
-        color_layer[h_mask] = (0, 255, 0)
-        idx = o_mask | h_mask
-        overlay[idx] = overlay[idx] * (1 - opacity) + color_layer[idx] * opacity
-        out_frames.append(np.clip(overlay, 0, 255).astype(np.uint8))
-    imageio.mimsave(output_path, out_frames, fps=max(1, fps))
-    return output_path
 
 
 # ── app state + point drawing ─────────────────────────────────────────────────
@@ -141,7 +128,7 @@ class AppState:
         self.hand_points = []
         self.object_masks = []
         self.hand_masks = []
-        self.mesh_path = None
+        self.voxels = None
 
 app_state = AppState()
 
@@ -209,20 +196,21 @@ def clear_all_points():
     return "All points cleared", get_marked_frame()
 
 
-def generate_masks_and_video():
+def generate_masks():
+    """Run SAM2 propagation. Returns (ok, message)."""
     try:
         if not app_state.frames or not app_state.temp_dir:
-            return gr.update(), gr.update(), "No frames available. Please upload a video first.", gr.update(interactive=False)
+            return False, "No frames available. Please upload a video first."
         if not app_state.object_points:
-            return gr.update(), gr.update(), "Please mark at least one Object point on the first frame.", gr.update(interactive=False)
+            return False, "Please mark at least one Object point on the first frame."
         object_masks, hand_masks = propagate_masks_sam2(
-            app_state.temp_dir, len(app_state.frames), app_state.object_points, app_state.hand_points)
+            app_state.temp_dir, len(app_state.frames),
+            app_state.object_points, app_state.hand_points,
+        )
         app_state.object_masks = object_masks
         app_state.hand_masks = hand_masks
-        out = os.path.join(app_state.temp_dir, "masked_video.mp4")
-        create_masked_video(app_state.frames, object_masks, hand_masks, app_state.fps, out)
-        return (gr.update(visible=False), gr.update(value=out, visible=True),
-                "Masks generated! Ready for 3D reconstruction.", gr.update(interactive=True))
+        return True, "Masks generated."
     except Exception as e:
-        return gr.update(), gr.update(), f"Error generating masks: {e}", gr.update(interactive=False)
+        return False, f"Error generating masks: {e}"
+
 

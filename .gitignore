@@ -13,7 +13,8 @@ dist/
 # ---- Logs & outputs ----
 *.log
 output_wild/
-assets/
+assets/*
+!assets/playvox.png
 .venv/
 venv/
 

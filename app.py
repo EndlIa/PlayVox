@@ -5,8 +5,12 @@ mask -> 64^3 occupied voxels. No SLAT, mesh, Gaussian, DA3, or FoundationPose.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 # Must be set before CUDA initialises: avoids fragmentation on 22-24GB cards.
@@ -24,7 +28,6 @@ import gradio as gr
 import numpy as np
 import plotly.graph_objects as go
 import torch
-from PIL import Image
 
 import tools  # noqa: F401
 import tools.stage1 as C
@@ -51,17 +54,79 @@ pipeline = build_pipeline(CKPT, DEVICE, config_path=PIPELINE_CONFIG)
 print(f"[PlayVox] ready: steps={STEPS}, cfg={CFG}, device={DEVICE}", flush=True)
 
 
+_CUBE_FACES = (
+    ((1, 0, 0), ((1, 0, 0), (1, 1, 0), (1, 1, 1), (1, 0, 1))),
+    ((-1, 0, 0), ((0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0))),
+    ((0, 1, 0), ((0, 1, 0), (0, 1, 1), (1, 1, 1), (1, 1, 0))),
+    ((0, -1, 0), ((0, 0, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1))),
+    ((0, 0, 1), ((0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))),
+    ((0, 0, -1), ((0, 0, 0), (0, 1, 0), (1, 1, 0), (1, 0, 0))),
+)
+
+
+def build_voxel_mesh(coords: np.ndarray):
+    """Return (vertices, faces) for the exposed cube faces of occupied voxels.
+
+    vertices: float32 [N, 3] in normalized [-0.5, 0.5] space.
+    faces:    int32 [M, 3] triangle indices into vertices.
+    """
+    coords = np.asarray(coords, dtype=np.int32)
+    if coords.size == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.int32)
+
+    occupied = set(map(tuple, coords.tolist()))
+    verts, index, faces = [], {}, []
+
+    def vid(point):
+        idx = index.get(point)
+        if idx is None:
+            idx = len(verts)
+            index[point] = idx
+            verts.append(point)
+        return idx
+
+    for x, y, z in occupied:
+        for (nx, ny, nz), corners in _CUBE_FACES:
+            if (x + nx, y + ny, z + nz) in occupied:
+                continue
+            a, b, c, d = (vid((x + cx, y + cy, z + cz)) for cx, cy, cz in corners)
+            faces.append((a, b, c))
+            faces.append((a, c, d))
+
+    vertices = np.asarray(verts, dtype=np.float32) / 64.0 - 0.5
+    return vertices, np.asarray(faces, dtype=np.int32)
+
+
 def voxel_figure(coords: np.ndarray) -> go.Figure:
-    coords = np.asarray(coords, dtype=np.float32)
+    """Render occupied voxels as opaque cubes."""
+    coords = np.asarray(coords, dtype=np.int32)
     if coords.size == 0:
         return go.Figure().update_layout(title="No occupied voxels")
-    xyz = (coords + 0.5) / 64.0 - 0.5
+
+    vertices, faces = build_voxel_mesh(coords)
     fig = go.Figure(
-        go.Scatter3d(
-            x=xyz[:, 0], y=xyz[:, 1], z=xyz[:, 2],
-            mode="markers",
-            marker={"size": 4, "color": xyz[:, 2], "colorscale": "Turbo", "opacity": 0.9},
-            hovertemplate="x=%{x:.3f}<br>y=%{y:.3f}<br>z=%{z:.3f}<extra></extra>",
+        go.Mesh3d(
+            x=vertices[:, 0],
+            y=vertices[:, 1],
+            z=vertices[:, 2],
+            i=faces[:, 0],
+            j=faces[:, 1],
+            k=faces[:, 2],
+            intensity=vertices[:, 2],
+            intensitymode="vertex",
+            colorscale="Turbo",
+            showscale=False,
+            flatshading=True,
+            opacity=1.0,
+            hoverinfo="skip",
+            lighting={
+                "ambient": 0.55,
+                "diffuse": 0.85,
+                "specular": 0.15,
+                "roughness": 0.85,
+                "fresnel": 0.1,
+            },
+            lightposition={"x": 120, "y": 200, "z": 160},
         )
     )
     fig.update_layout(
@@ -77,17 +142,40 @@ def voxel_figure(coords: np.ndarray) -> go.Figure:
     return fig
 
 
-def amodal_mask_image(z_mask: torch.Tensor | None) -> Image.Image | None:
-    if z_mask is None:
-        return None
-    pred = (z_mask[0, :, 0] > 0).detach().cpu().numpy().astype(np.uint8) * 255
-    rows = [row for row in pred[:8]]
-    if not rows:
-        return None
-    canvas = rows[0]
-    for row in rows[1:]:
-        canvas = np.concatenate([canvas, np.full((4, 64), 128, np.uint8), row], axis=0)
-    return Image.fromarray(canvas, mode="L").resize((256, 256), Image.Resampling.NEAREST)
+def export_voxels(coords: np.ndarray, path: Path) -> Path:
+    """Write voxels.npz + voxels.obj + meta.json into a single zip."""
+    coords = np.asarray(coords, dtype=np.uint8)
+    vertices, faces = build_voxel_mesh(coords)
+    buffer = io.BytesIO()
+    np.savez_compressed(buffer, coords=coords, resolution=64)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("voxels.npz", buffer.getvalue())
+        obj = [
+            f"v {x:.6f} {y:.6f} {z:.6f}" for x, y, z in vertices
+        ] + [
+            f"f {a + 1} {b + 1} {c + 1}" for a, b, c in faces
+        ]
+        zf.writestr("voxels.obj", "\n".join(obj) + "\n")
+        zf.writestr(
+            "meta.json",
+            json.dumps(
+                {
+                    "format": "playvox-voxels/1",
+                    "resolution": 64,
+                    "voxel_count": int(len(coords)),
+                    "grid": "occupancy indices in [0, 63]",
+                    "obj_space": "normalized [-0.5, 0.5]; no metric scale",
+                    "views": len(ui.app_state.frames),
+                    "steps": STEPS,
+                    "cfg": CFG,
+                    "seed": SEED,
+                    "checkpoint": Path(CKPT).name,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                indent=2,
+            ),
+        )
+    return path
 
 
 def reconstruct_voxels(seed):
@@ -110,62 +198,105 @@ def reconstruct_voxels(seed):
     ])
     with torch.inference_mode():
         cond, raw_ctx = C.build_cond(pipeline, rgb, obj, hand, DEVICE)
-        z_shape, z_mask = C.joint_sample(
+        z_shape, _z_mask = C.joint_sample(
             pipeline, cond, raw_ctx, len(ui.app_state.frames),
             steps=STEPS, cfg=CFG, device=DEVICE, seed=seed,
         )
         coords = C.decode_shape(pipeline, z_shape)
+    ui.app_state.voxels = coords
     fig = voxel_figure(coords)
-    mask_img = amodal_mask_image(z_mask)
-    return fig, mask_img, f"PlayVox complete: {len(coords):,} occupied voxels; {len(ui.app_state.frames)} views; {STEPS} steps."
+    return fig, f"PlayVox complete: {len(coords):,} occupied voxels; {len(ui.app_state.frames)} views; {STEPS} steps."
 
+
+SEED = 42
 
 with gr.Blocks(title="PlayVox") as demo:
-    gr.Markdown("# PlayVox\n**ForeHOI stage-1 voxel completion** — SAM2 masks → 64³ occupied voxels")
+    gr.Image(
+        value=str(HERE / "assets" / "playvox.png"),
+        show_label=False, container=False, interactive=False,
+        height=90, show_download_button=False, show_fullscreen_button=False,
+    )
+    gr.Markdown("**ForeHOI stage-1 voxel completion** — SAM2 masks → 64³ occupied voxels")
+    gr.Markdown("上传视频后标记手的位置和物体的位置, 确认无误后点击生成即可")
+
     with gr.Row():
         with gr.Column():
             video_input = gr.Video(label="Upload Video", format="mp4", height=420)
             num_samples = gr.Slider(2, 12, value=6, step=1, label="Frames to sample")
-            seed_input = gr.Number(label="Seed", value=42, precision=0)
-            process_btn = gr.Button("Process Video", variant="primary")
         with gr.Column():
-            first_frame = gr.Image(label="First frame: click object/hand points", interactive=False, type="numpy", height=420, visible=False)
-            masked_video = gr.Video(label="SAM2 masks", height=300, visible=False)
-            status = gr.Textbox(label="Status", interactive=False)
+            first_frame = gr.Image(
+                label="Click object/hand points",
+                interactive=False, type="numpy", height=420, visible=False,
+            )
+
     mask_type = gr.Radio(["object", "hand"], value="object", label="Point type")
     with gr.Row():
         clear_obj = gr.Button("Clear object points")
         clear_hand = gr.Button("Clear hand points")
         clear_all = gr.Button("Clear all points")
     point_info = gr.Textbox(label="Point info", interactive=False)
-    generate_btn = gr.Button("Generate SAM2 masks", variant="primary")
-    reconstruct_btn = gr.Button("Generate PlayVox", variant="primary")
-    with gr.Row():
-        voxel_output = gr.Plot(label="Voxel reconstruction")
-        amodal_output = gr.Image(label="Predicted amodal masks")
-    result_status = gr.Textbox(label="PlayVox result", interactive=False)
 
-    process_btn.click(
-        ui.process_video_upload,
+    generate_btn = gr.Button("Generate", variant="primary")
+    voxel_output = gr.Plot(label="Voxel reconstruction")
+    download_btn = gr.DownloadButton(
+        "Download voxels (.zip)", value=None, interactive=False
+    )
+    status = gr.Textbox(label="Status", interactive=False)
+
+    disabled_download = lambda: gr.update(value=None, interactive=False)
+
+    def on_video(video_path, frames):
+        if not video_path:
+            return gr.update(), "Upload a video first.", None, "", disabled_download()
+        frame, msg, _n, _btn = ui.process_video_upload(video_path, frames)
+        return frame, msg, None, "", disabled_download()
+
+    def select_point(mask_type_value, evt: gr.SelectData):
+        msg, frame = ui.handle_point_selection(mask_type_value, evt)
+        return msg, frame, None, "", disabled_download()
+
+    def clear_points(kind):
+        fn = {
+            "object": ui.clear_object_points,
+            "hand": ui.clear_hand_points,
+            "all": ui.clear_all_points,
+        }[kind]
+        msg, frame = fn()
+        return msg, frame, None, "", disabled_download()
+
+    def generate_all():
+        ok, msg = ui.generate_masks()
+        if not ok:
+            return msg, None, disabled_download()
+        fig, result = reconstruct_voxels(SEED)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = export_voxels(ui.app_state.voxels, OUTPUT_DIR / f"voxels_{stamp}.zip")
+        return f"{msg} {result}", fig, gr.update(value=str(path), interactive=True)
+
+    video_input.upload(
+        on_video,
         inputs=[video_input, num_samples],
-        outputs=[first_frame, status, num_samples, process_btn],
+        outputs=[first_frame, status, voxel_output, point_info, download_btn],
+    )
+    num_samples.release(
+        on_video,
+        inputs=[video_input, num_samples],
+        outputs=[first_frame, status, voxel_output, point_info, download_btn],
     )
     first_frame.select(
-        ui.handle_point_selection,
+        select_point,
         inputs=[mask_type],
-        outputs=[point_info, first_frame],
+        outputs=[point_info, first_frame, voxel_output, status, download_btn],
     )
-    clear_obj.click(ui.clear_object_points, outputs=[point_info, first_frame])
-    clear_hand.click(ui.clear_hand_points, outputs=[point_info, first_frame])
-    clear_all.click(ui.clear_all_points, outputs=[point_info, first_frame])
+    clear_obj.click(lambda: clear_points("object"),
+                    outputs=[point_info, first_frame, voxel_output, status, download_btn])
+    clear_hand.click(lambda: clear_points("hand"),
+                     outputs=[point_info, first_frame, voxel_output, status, download_btn])
+    clear_all.click(lambda: clear_points("all"),
+                    outputs=[point_info, first_frame, voxel_output, status, download_btn])
     generate_btn.click(
-        ui.generate_masks_and_video,
-        outputs=[first_frame, masked_video, status, reconstruct_btn],
-    )
-    reconstruct_btn.click(
-        reconstruct_voxels,
-        inputs=[seed_input],
-        outputs=[voxel_output, amodal_output, result_status],
+        generate_all,
+        outputs=[status, voxel_output, download_btn],
     )
 
 
