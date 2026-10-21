@@ -13,7 +13,9 @@ dist/
 # ---- Logs & outputs ----
 *.log
 output_wild/
-fpose/
+assets/
+.venv/
+venv/
 
 # ---- Model checkpoints & weights (large binaries) ----
 # weights/ is ignored wholesale; small .yaml configs in checkpoints/ stay tracked.
@@ -26,3 +28,4 @@ fpose/
 *.h5
 *.npz
 weights/
+checkpoints/models/

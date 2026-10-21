@@ -1,20 +1,19 @@
-"""forehoi.tools — shared inference core for the local (trained) MV-SS pipeline.
+"""PlayVox tooling package.
 
-Both the app (app_forehoi_sam3d.py) and the eval scripts import from here:
-    from tools.pipeline import build_full_pipeline, save_mask_png
-    import tools.mask_eval_common as C
-
-Importing this package puts the repo root and core/ on sys.path so that
-`import sam3d_objects`, `from inference import Inference`, and
-`from training import load_model_part` resolve regardless of the caller's CWD.
+Puts the repository root on ``sys.path`` so ``import forehoi`` / ``import ui``
+work regardless of the caller's cwd.
 """
 import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (ROOT, os.path.join(ROOT, "core")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
-CHECKPOINTS = os.path.join(ROOT, "checkpoints")
-PIPELINE_CONFIG = os.path.join(CHECKPOINTS, "pipeline.yaml")
+# Default config location. The app passes its own path derived from
+# ``PLAYVOX_DATA``; this is only a fallback for scripts.
+_DATA = os.environ.get("PLAYVOX_DATA", "")
+PIPELINE_CONFIG = os.environ.get(
+    "PLAYVOX_PIPELINE_CONFIG",
+    os.path.join(_DATA, "checkpoints", "pipeline.yaml") if _DATA else "",
+)

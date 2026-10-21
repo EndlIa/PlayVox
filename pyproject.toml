@@ -2,29 +2,22 @@
 requires = ["hatchling", "hatch-requirements-txt"]
 build-backend = "hatchling.build"
 
-[tool.hatch.envs.default.env-vars]
-PIP_EXTRA_INDEX_URL = "https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu121"
-
 [tool.hatch.metadata]
 # for git-referenced dependencies
 allow-direct-references = true
 
 [project]
-name = "sam3d_objects"
-version = "0.0.1"
+name = "playvox"
+version = "0.1.0"
+description = "PlayVox: ForeHOI stage-1 voxel completion demo"
 # required for "hatch-requirements-txt" to work
-dynamic = ["dependencies", "optional-dependencies"]
+dynamic = ["dependencies"]
 
 [tool.hatch.build]
 ignore-vcs = true
 include = ["**/*.py"]
 exclude = ["conftest.py", "*_test.py"]
-packages = ["sam3d_objects"]
+packages = ["forehoi"]
 
 [tool.hatch.metadata.hooks.requirements_txt]
 files = ["requirements.txt"]
-
-[tool.hatch.metadata.hooks.requirements_txt.optional-dependencies]
-p3d = ["requirements.p3d.txt"]
-inference = ["requirements.inference.txt"]
-dev = ["requirements.dev.txt"]
